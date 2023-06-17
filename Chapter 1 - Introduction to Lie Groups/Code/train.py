@@ -2,20 +2,31 @@ import logging
 import torch
 import torch.optim as optim
 import torch.nn as nn
+
 from model import RotationallyInvariantGPT, RotationallyInvariantGPTConfig
-from utils import move_to_device, new_rielu, collate_fn, get_batch, new_rielu
+from utils import *
 from nanoGPT.model import GPTConfig, GPT, MLP
+from datasets import load_from_disk
+from torch.utils.data import DataLoader
 
-import multiprocessing as mp
-#mp.set_start_method('fork')
+class TokenizedTextDataset(torch.utils.data.Dataset):
+    def __init__(self, tokenized_dataset):
+        self.tokenized_dataset = tokenized_dataset
 
+    def __len__(self):
+        return len(self.tokenized_dataset)
+
+    def __getitem__(self, idx):
+        item = self.tokenized_dataset[idx]
+        ids = torch.tensor(item["ids"], dtype=torch.long)
+        return ids[:-1], ids[1:]
 
 # Training loop
-def train(model: nn.Module, optimizer: optim.Optimizer, num_batches: int) -> float:
+def train(model: nn.Module, optimizer: optim.Optimizer, train_loader) -> float:
     model.train()
     running_loss = 0
-    for i in range(num_batches):
-        inputs, targets = get_batch('train')
+    for inputs, targets in train_loader:
+        inputs, targets = inputs.to(device), targets.to(device)
         optimizer.zero_grad()
         logits, loss = model(inputs, targets)
         loss.backward()
@@ -23,25 +34,36 @@ def train(model: nn.Module, optimizer: optim.Optimizer, num_batches: int) -> flo
         running_loss += loss.item()
         if i % 100 == 0:
             logging.info(f"Batch {i}: Loss={loss.item()}")
-    return running_loss / num_batches
+    return running_loss / len(train_loader)
 
-def evaluate(model, num_batches: int) -> float:
+def evaluate(model, valid_loader) -> float:
     model.eval()
     running_loss = 0
     with torch.no_grad():
-        for i in range(num_batches):
-            inputs, targets = get_batch('val')
+        for inputs, targets in valid_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
             logits, loss = model(inputs, targets)
             running_loss += loss.item()
             if i % 100 == 0:
                 logging.info(f"Batch {i}: Validation Loss={loss.item()}")
-    return running_loss / num_batches
+    return running_loss / len(valid_loader)
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
-    mp.set_start_method('fork')
+    
+    # Load the tokenized dataset from disk
+    tokenized_train = load_from_disk("train_dataset")
+    tokenized_val = load_from_disk("val_dataset")
 
-    mp.freeze_support()
+    # Create train/val dataset objects
+    train_dataset = TokenizedTextDataset(tokenized_train)
+    valid_dataset = TokenizedTextDataset(tokenized_val)
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    valid_loader = DataLoader(valid_dataset, batch_size=eval_batch_size, shuffle=False)
+
+    vocab_size = 50257  # GPT-2 tokenizer vocab size
+    logging.info(f"Vocab size: {vocab_size}")
     
     # Configs
     d_model = 512
@@ -59,15 +81,10 @@ if __name__ == '__main__':
     logging.info(f"Training for {epochs} epochs with a learning rate of {lr}...")
     logging.info(f"Batch size: {batch_size}")
     logging.info(f"Eval batch size: {eval_batch_size}")
-
-    # Here, you will need to manually set the vocab size based on your dataset and tokenizer
-    vocab_size = 50257  # GPT-2 tokenizer vocab size
-
-    logging.info(f"Vocab size: {vocab_size}")
-
+    
     # Calculate the number of batches
-    num_train_batches = len(train_data) // batch_size
-    num_eval_batches = len(valid_data) // eval_batch_size
+    num_train_batches = len(train_dataset) // batch_size
+    num_eval_batches = len(valid_dataset) // eval_batch_size
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logging.info(f"Device: {device}")

@@ -9,7 +9,7 @@ from tfx.proto import trainer_pb2
 _pipeline_name = 'my_pipeline'
 _pipeline_root = os.path.join('pipeline', _pipeline_name)
 _data_path = 'C:\Users\User\LieGroupsDeepLearning\Chapter 1 - Introduction to Lie Groups\Code\wikitext-2'
-_log_path = 'C:\Users\User\LieGroupsDeepLearning\Chapter 1 - Introduction to Lie Groups\Notes\'
+_log_path = 'C:\Users\User\LieGroupsDeepLearning\Chapter 1 - Introduction to Lie Groups\Notes\log.txt'
 
 # Define the data ingestion component
 example_gen = CsvExampleGen(input_base=_data_path)
