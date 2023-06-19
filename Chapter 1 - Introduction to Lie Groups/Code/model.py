@@ -23,7 +23,8 @@ class RotationallyInvariantGPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-    
+    rotational_invariance: bool = True # Set to True to enable the rotationally invariant gate layers
+
     
 
 # Models
@@ -33,92 +34,108 @@ class RotationInvariantLayerNorm(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(ndim))
         self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
+        self.rotation_gate = nn.Linear(ndim, ndim, bias=False)  # no bias needed for rotation
+        self.rotation_gate.weight.data = torch.eye(ndim)
 
-    def forward(self, input):
+    def forward(self, input, rotation_matrix=None):
+        # apply rotation
+        if rotation_matrix is not None:
+            input = torch.matmul(input, self.rotation_gate(rotation_matrix))
+
+        # normalize
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
-class RotationInvariantAttention(nn.Module):  # modified from nanoGPT causal self-attention
 
+class RotationallyInvariantAttention(nn.Module):
+    
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
-        # key, query, value projections for all heads, but in a batch
+
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-        # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        # regularization
+
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
+
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+
+        self.gate_q = nn.Linear(config.n_embd, config.n_embd)
+        self.gate_k = nn.Linear(config.n_embd, config.n_embd)
+
         if not self.flash:
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            # causal mask to ensure that attention is only applied to the left in the input sequence
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
-
 
     def forward(self, x):
         B, T, C = x.size()
 
-        # calculate query, key, values for all heads in batch
         q, k, v = self.c_attn(x).chunk(3, dim=-1)
 
-        # reshape q, k, v for multihead attention
         q = q.view(B, T, self.n_head, C // self.n_head).permute(0, 2, 1, 3)
         k = k.view(B, T, self.n_head, C // self.n_head).permute(0, 2, 1, 3)
         v = v.view(B, T, self.n_head, C // self.n_head).permute(0, 2, 1, 3)
 
-        # Calculate attention scores as negative Euclidean distance
-        att_scores = -torch.sqrt(torch.sum((q.unsqueeze(-2) - k.unsqueeze(-3)) ** 2, dim=-1))
+        gate_q = torch.sigmoid(self.gate_q(q))
+        gate_k = torch.sigmoid(self.gate_k(k))
 
-        # Scale the attention scores by the square root of their dimensionality
-        scaling_factor = q.size(-1) ** 0.5  # assuming q and k have the same dimensionality
-        att_scores = att_scores / scaling_factor
+        # Traditional dot-product attention
+        att_dotproduct = torch.matmul(q, k.transpose(-2, -1))
+        att_dotproduct = att_dotproduct / math.sqrt(self.n_embd)
 
-        # Apply softmax to obtain attention weights
+        # Rotation invariant attention
+        att_rotation = -torch.sqrt(torch.sum((q.unsqueeze(-2) - k.unsqueeze(-3)) ** 2, dim=-1))
+        att_rotation = att_rotation / math.sqrt(self.n_embd)
+
+        # Apply gating to attention scores
+        att_scores = gate_q * att_dotproduct + (1 - gate_q) * att_rotation
+        att_scores = att_scores / gate_k
+
         att_weights = F.softmax(att_scores, dim=-1)
 
-        # calculate weighted sum of value vectors
-        y = torch.matmul(att_weights.unsqueeze(-2), v).squeeze(-2)
-
-        # re-assemble all head outputs side by side
+        y = torch.matmul(att_weights, v)
         y = y.permute(0, 2, 1, 3).contiguous().view(B, T, C)
 
-        # output projection
         y = self.resid_dropout(self.c_proj(y))
         return y
 
-class RotationallyInvariantMLP(nn.Module):  # copied directly from nanoGPT causal self-attention
+
+class RotationallyInvariantMLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
         self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
+        self.rotation_gate = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)  # Added rotational gate layer
+        self.rotation_gate.weight.data = torch.eye(config.n_embd)  # Assuming initial rotation matrix as an identity matrix
 
-    def forward(self, x):
+    def forward(self, x, rotation_matrix=None):
         x = self.c_fc(x)
-        x = new_gelu(x)
+        x = F.gelu(x)
         x = self.c_proj(x)
         x = self.dropout(x)
+
+        # Rotational Invariance Part
+        if rotation_matrix is not None:
+            x = torch.matmul(x, self.rotation_gate(rotation_matrix))
+
         return x
 
-class RotationallyInvariantBlock(nn.Module): # modified from nanoGPT causal self-attention
+class RotationallyInvariantBlock(nn.Module):
 
     def __init__(self, config):
         super().__init__()
         self.ln_1 = RotationInvariantLayerNorm(config.n_embd, bias=config.bias)
         self.attn = RotationInvariantAttention(config)
         self.ln_2 = RotationInvariantLayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
+        self.mlp = RotationallyInvariantMLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+    def forward(self, x, rotation_matrix=None):
+        x = x + self.attn(self.ln_1(x), rotation_matrix)
+        x = x + self.mlp(self.ln_2(x), rotation_matrix)
         return x
 
 

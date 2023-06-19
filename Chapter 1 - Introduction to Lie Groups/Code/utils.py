@@ -9,10 +9,11 @@ from datasets import load_dataset
 from torch.utils.data import DataLoader
 import multiprocessing as mp
 
-def process(example, enc):
-    ids = enc.encode(example['text']).ids
-    ids.append(enc.eod_token)
+def process(example, tokenizer):
+    ids = tokenizer.encode(example['text'], max_length=1024, truncation=True)
+    ids.append(tokenizer.eos_token_id)  # Appending the End of Document token
     return {'ids': ids, 'len': len(ids)}
+
 
 def get_batch(split):
     data = train_data if split == 'train' else val_data
